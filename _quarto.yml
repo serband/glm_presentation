@@ -1,10 +1,16 @@
 project:
   type: website
-  title: "GLMsAreGood"
+  output-dir: docs
+
+website:
+  title: "GLMs dont suck"
+  navbar:
+    left:
+      - href: GLMsAreGood.qmd
+        text: Presentation
 
 format:
-  revealjs:
-    transition: slide
-    theme: default
-    footer: "GLMsAreGood Presentation"
-    editor: visual
+  html:
+    theme: cosmo
+    css: styles.css
+    code-fold: true

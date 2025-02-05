@@ -176,8 +176,8 @@ ggpairs(df[sample(.N, size = 0.05 * .N), ..numeric_cols, with = FALSE][, !("IDpo
 
 ### Basic Adjustments
 
--   Exposure \> 0
--   Vehicle Age \<= 90
+-   Exposure > 0
+-   Vehicle Age <= 90
 -   Cap Claims to 3
 
 ```{r}
