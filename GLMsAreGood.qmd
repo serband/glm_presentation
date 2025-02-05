@@ -1,0 +1,1450 @@
+---
+title: "Stop being mean about GLMs"
+author: "Serban Dragne"
+format: revealjs
+editor: visual
+keep-md: true
+---
+
+## 99% ranting, 10% informative, 50% being bad at math
+
+```{r}
+library(ggplot2)
+
+# Create data
+data <- data.frame(
+  category = c("Ranting", "Jokes","Cat Pictures"),
+  value = c(98, 1,1)
+)
+
+# Create pie chart
+ggplot(data, aes(x = "", y = value, fill = category)) +
+  geom_bar(stat = "identity", width = 1, color = "grey") +
+  coord_polar("y", start = 0) +
+  theme_void() +
+  scale_fill_manual(values = c("green", "blue","red")) + 
+  ggtitle("Presentation Breakdown") +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.title = element_blank()
+  )
+
+```
+
+## Who is me?
+
+-   Motor Insurance pricing
+-   GLM enthusiast
+-   Chronically online
+-   Make presentations the night before without running through them
+
+## Why rant? {.scrollable}
+
+![](https://i.imgur.com/91sn32Q.jpeg) - GLMs are GodTier for tabular data - Its fun to rant (for me) - Make Chris sad (nothing Bayesian will be mentioned) - Psyop the public for propaganda - I just like GLMs and my mom says I'm handsome ok?
+
+TLDR: GLMs are pretty great
+
+![](https://i.imgflip.com/9j2agk.jpg)
+
+### The GLM Strawman Argument {.scrollable}
+
+![Fake news](https://imgur.com/soweg5Y) ![](https://imgur.com/O4qqyi3) ![](https://imgur.com/BoT2W5E)
+
+-   https://www.theactuary.com/2024/03/05/gladiators-ready-pricing-models-fight-it-out
+-   https://www.theactuary.com/2024/02/01/data-science-lab-gbms-or-neural-networks
+-   https://www.diva-portal.org/smash/get/diva2:1656340/FULLTEXT01.pdf
+
+![](https://i.imgur.com/9YfnIQB.png)
+
+### The Failed Promises of ML {.scrollable}
+
+-   Models that 'just work' out the box
+-   SHAP, PDP etc are not true explainability
+-   Most (**relevant**) insurance data is undeveloped
+-   Models are not robust to mix change
+-   Very difficult to price for new segments
+-   Difficult to 'force behaviour'
+
+## Overview
+
+-   All GLM comparisons benchmark GLMs no one would ever use in practice
+-   GLMs can perform almost as well as anything on tabular data
+-   ...But can still be deployed on a piece of paper
+-   Show a fun technique for getting great-performing GLMs out the box
+-   Adding Interactions
+
+## Good ol' freMTPL2freq {.scrollable}
+
+-   Cant use company data :(
+-   freMTPL2freq in the *CASdatasets* R library
+-   Try and predict claim frequencies
+
+```{r}
+#| label: data-prep
+#| warning: false
+#| echo: true  
+
+
+# Owning the Libs
+library(CASdatasets)
+library(tidyverse)
+library(data.table)
+library(ggplot2)
+library(GGally)
+library(reshape2)
+library(corrplot)
+library(glmnet)
+library(glmnetUtils)
+library(h2o)
+library(rlang)
+
+# set random seed 
+set.seed(2432)
+
+# Store model results
+storage <- tibble::tribble(~Model,~OutOfSampleDeviance)
+
+
+# Formula for poisson deviance 
+poisson_deviance <- function(actual, predicted){
+  2 * sum(actual * log(pmax(actual,0.00001) / predicted) - (actual - predicted))
+}
+
+# Load the freMTPL2freq dataset from CASdatasets library
+data("freMTPL2freq")
+df <- setDT(freMTPL2freq)
+rm(freMTPL2freq); gc();
+
+# Manually specify which columns are numeric and which are categorical
+numeric_cols = c('IDpol', 'ClaimNb', 'Exposure', 'VehPower', 'VehAge', 'DrivAge', 'BonusMalus', 'Density')
+categorical_cols = c('VehBrand', 'VehGas', 'Area', 'Region')
+
+# Convert variables to corect type
+df[, (numeric_cols) := lapply(.SD, as.numeric), .SDcols = numeric_cols]
+df[, (categorical_cols) := lapply(.SD, as.factor), .SDcols = categorical_cols]
+
+glimpse(df)
+```
+
+## Data Overview {.scrollable}
+
+```{r}
+#| label: data-plots
+#| warning: false
+#| echo: true  
+
+# Plot histograms for numeric columns
+numeric_cols <- setdiff(names(df)[sapply(df, is.numeric)],"IDpol")
+
+# Loop through numeric columns and plot histograms individually
+for (col in numeric_cols) {
+  p <- ggplot(df, aes(x = !!sym(col))) +
+    geom_histogram(bins = 15) +
+    ggtitle(col) +
+    theme_minimal()
+  
+  print(p)
+}
+
+# Convert categorical columns to factors
+categorical_cols <- setdiff(names(df)[sapply(df, is.factor)],"IDpol")
+df[, (categorical_cols) := lapply(.SD, as.factor), .SDcols = categorical_cols]
+
+# Plot bar charts for categorical columns
+for (col in categorical_cols) {
+  counts <- df[, .N, by = .(category = get(col))]
+  
+  p <- ggplot(counts, aes(x = category, y = N)) +
+    geom_bar(stat = "identity") +  # Use precomputed counts
+    ggtitle(col) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  print(p)
+}
+
+# Correlation plot for numeric columns
+corr_matrix <- cor(df[, ..numeric_cols], use = "complete.obs")
+corrplot(corr_matrix, method = "color", col = colorRampPalette(c("blue", "white", "red"))(200), 
+         addCoef.col = "black", tl.col = "black", tl.srt = 45, 
+         title = "Correlation Matrix", mar = c(0, 0, 1, 0))
+
+# Pairwise plots for numeric columns (sample 20% because it takes ages to plot)
+ggpairs(df[sample(.N, size = 0.05 * .N), ..numeric_cols, with = FALSE][, !("IDpol"), with = FALSE]) + theme_minimal() + ggtitle("Pairs Plot")
+
+```
+
+### Basic Adjustments
+
+-   Exposure \> 0
+-   Vehicle Age \<= 90
+-   Cap Claims to 3
+
+```{r}
+#| label: data-adjustments
+#| warning: false
+#| echo: true  
+
+# Remove Vehicle Age > 90 as unlikely true
+df <- df[VehAge <= 90 & Exposure > 0]
+
+# Check claims count
+df[, .(Nrs = .N), by = ClaimNb]
+
+# Clip claim count to 3
+df[, ClaimNb := pmin(ClaimNb, 3)]
+# Split data - create train/test column
+df[,Split := fifelse(runif(nrow(df),0,1) < 0.7,1,0)] # train/test split based on 70% train 30%test 
+df[,ClaimNb_W := ClaimNb/Exposure]
+df[,Weight := Exposure]
+
+# Check claims count
+df[, .(Nrs = .N), by = ClaimNb]
+```
+
+## Intercept Only Model {.scrollable}
+
+Predicting claim frequency using just the average claim frequency
+
+```{r}
+#| label: intercept
+#| warnings: false
+#| messages: false
+#| echo: true  
+
+
+options(scipen = 999)
+
+# fit an intercept model 
+intercept_model <- glm(ClaimNb ~ 1 + offset(log(Exposure)), data = df[Split==1,], family = poisson("log"))
+
+
+broom::tidy(intercept_model) |>
+  select(term, estimate, p.value) |>
+  mutate(p.value = scales::pvalue(p.value))
+
+
+# check the out of sample deviance with the model 
+df[, intercept_predictions := predict(intercept_model, df, type = "response")]
+
+
+intercept_performance <- poisson_deviance(df$ClaimNb[df$Split==0], df$intercept_predictions[df$Split==0]) # 51172.16
+
+
+storage <-  tibble::add_row(storage,
+                            Model = "Intercept-only GLM",
+                            OutOfSampleDeviance = intercept_performance
+                            )
+
+
+knitr::kable(storage)
+
+```
+
+## 'Strawman' GLM {.scrollable}
+
+-   Baseline GLM typically compared against:
+    -   *All variables used*
+    -   *No feature engineering*
+    -   *No interactions*
+    -   *Linear Effects*
+    -   *Fit all high cardinality variables*
+
+```{r}
+#| label: basic-glms
+#| warnings: false
+#| messages: false
+#| echo: true  
+
+
+
+# Naive glm 
+naive_glm <- glm(ClaimNb ~ VehPower + VehAge + DrivAge + BonusMalus + VehBrand + VehGas + Area + Density + Region + offset(log(Exposure)), data = df[Split==1,], family = poisson("log"))
+
+# Neaten up 
+broom::tidy(naive_glm) |>
+  select(term, estimate, p.value) |>
+  mutate(p.value = scales::pvalue(p.value))
+
+# Add preds
+df[, base_glm_predictions := predict(naive_glm, df, type = "response")]
+
+# CAlc perf
+basic_glm_performance <- poisson_deviance(df$ClaimNb[df$Split==0], df$base_glm_predictions[df$Split==0]) # 49736.5
+
+
+# Add
+storage <-  tibble::add_row(storage,
+                            Model = "Basic GLM",
+                            OutOfSampleDeviance = basic_glm_performance
+                            )
+
+# Check perf
+knitr::kable(storage)
+
+
+```
+
+## FF NN {.scrollable}
+
+```{r}
+#| label: FFNN
+#| warnings: false
+#| messages: false
+#| echo: true  
+
+library(keras)
+library(tensorflow)
+library(dplyr)
+library(caret)
+
+# train/test split
+train_data <- df[Split == 1]
+test_data <- df[Split == 0]
+
+# make features and target
+X_train <- train_data[, .SD, .SDcols = c(numeric_cols, categorical_cols)]
+X_test <- test_data[, .SD, .SDcols = c(numeric_cols, categorical_cols)]
+y_train <- train_data$ClaimNb/train_data$Exposure
+y_test <- test_data$ClaimNb/test_data$Exposure
+exposure_train <- train_data$Exposure
+exposure_test <- test_data$Exposure
+
+# exclude Exposure and ClaimNb from scaling
+numeric_cols_to_scale <- numeric_cols[!numeric_cols %in% c('Exposure', 'ClaimNb')]
+
+scaler <- preProcess(X_train[, ..numeric_cols_to_scale], method = c("center", "scale"))
+X_train_numeric <- predict(scaler, X_train[, ..numeric_cols_to_scale])
+X_test_numeric <- predict(scaler, X_test[, ..numeric_cols_to_scale])
+
+# One-hot encode categorical columns (could do embedding if hundreds of levels?)
+dummy <- dummyVars(~ ., data = X_train[, ..categorical_cols], fullRank = TRUE)
+X_train_categorical <- predict(dummy, X_train[, ..categorical_cols])
+X_test_categorical <- predict(dummy, X_test[, ..categorical_cols])
+
+# Aling one-hot encoded columns to ensure train and test have the same shape otherwise fails 
+if (ncol(X_train_categorical) != ncol(X_test_categorical)) {
+  X_train_categorical <- as.data.frame(X_train_categorical)
+  X_test_categorical <- as.data.frame(X_test_categorical)
+  aligned_data <- align_data(X_train_categorical, X_test_categorical)
+  X_train_categorical <- aligned_data$train
+  X_test_categorical <- aligned_data$test
+}
+
+# Combine scaled numeric & categorical features back together
+X_train_processed <- as.matrix(cbind(X_train_numeric, X_train_categorical))
+X_test_processed <- as.matrix(cbind(X_test_numeric, X_test_categorical))
+
+# helps to have a higher min exposure 
+w_train <- pmax(exposure_train, 0.0001)  
+w_test <- pmax(exposure_test, 0.0001)    
+
+# =====================
+# STEP 2: DEFINE FFNN
+# =====================
+
+# Define the model using the Sequential API
+input <- layer_input(shape = c(ncol(X_train_processed)))
+output <- input %>%
+  layer_dense(units = 128, activation = 'relu') %>%
+  layer_batch_normalization() %>%
+  layer_dropout(rate = 0.3) %>%
+  layer_dense(units = 64, activation = 'relu') %>%
+  layer_batch_normalization() %>%
+  layer_dropout(rate = 0.3) %>%
+  layer_dense(units = 32, activation = 'relu') %>%
+  layer_batch_normalization() %>%
+  layer_dropout(rate = 0.2) %>%
+  layer_dense(units = 1, activation = 'exponential')
+
+nn <- keras_model(inputs = input, outputs = output)
+
+
+
+# Compile 
+nn %>% compile(
+  optimizer = optimizer_adam(learning_rate = 0.001),
+  loss = "poisson",
+  metrics = list(metric_poisson),
+  weighted_metrics = list(metric_poisson)  # Ensures it's weighted correctly
+)
+
+# Define callbacks
+callbacks <- list(
+  callback_early_stopping(monitor = 'val_loss', patience = 5, restore_best_weights = TRUE),
+  callback_model_checkpoint(filepath = 'best_model.h5', monitor = 'val_loss', save_best_only = TRUE, verbose = 1),
+  callback_reduce_lr_on_plateau(monitor = 'val_loss', factor = 0.5, patience = 3, min_lr = 1e-6)
+)
+
+# =====================
+# STEP 3: TRAINING 
+# =====================
+
+# Train
+history <- nn %>% fit(
+  x = X_train_processed,
+  y = y_train,
+  sample_weight = w_train,  # Include weights during training
+  epochs = 200,
+  batch_size = 1024,
+  validation_split = 0.2,  # Use 20% of training data for validation
+  callbacks = callbacks,
+  shuffle = TRUE,
+  verbose = 1
+)
+
+# =====================
+# STEP 4: EVAL
+# =====================
+
+# Load best model
+best_nn <- load_model_hdf5('best_model.h5')
+
+# Predict on test set
+nn_pred <- predict(best_nn, X_test_processed) %>% as.vector() * w_test
+
+# Poisson Deviance
+poisson_deviance_nn <- poisson_deviance(y_test*w_test , nn_pred)
+
+# Add to storage
+storage <-  tibble::add_row(storage,
+                            Model = "FF NN",
+                            OutOfSampleDeviance = poisson_deviance_nn
+                            )
+
+# Show performance
+knitr::kable(storage %>% arrange(desc(OutOfSampleDeviance)))
+
+```
+
+\![\]https://imgur.com/6tXlBUp)
+
+### SHAP effects
+
+```{r}
+#| label: FFNN_Shapes
+#| warnings: false
+#| messages: false
+#| echo: true
+
+library(fastshap)
+library(ggplot2)
+library(reticulate)
+
+# Convert training/test data to data frames with column names
+X_train_df <- as.data.frame(X_train_processed)
+colnames(X_train_df) <- colnames(X_train_processed)
+
+X_test_df <- as.data.frame(X_test_processed)
+colnames(X_test_df) <- colnames(X_test_processed)
+
+predict_function <- function(model, newdata) {
+  as.vector(predict(model, as.matrix(newdata)))  # Ensure input is a matrix
+}
+
+
+background_data <- X_train_df[sample(nrow(X_train_df), 1000), ]  # Background data
+test_sample <- X_test_df[1:1000, ]  # Subset of test data for explanation
+
+py_run_string("import matplotlib")
+shap <- import("shap")
+plt <- import("matplotlib.pyplot")
+
+np <- import("numpy")
+background_data <- np$array(X_train_processed[sample(nrow(X_train_processed), 1000), ]) # Define background data (as a numpy array)
+
+# Initialize DeepExplainer with the Python model
+explainer <- shap$DeepExplainer(
+  model = best_nn,
+  data = background_data
+)
+
+# Compute SHAP values for test data
+test_sample <- np$array(X_test_processed[1:1000, ])
+shap_values <- explainer$shap_values(test_sample)
+
+# Convert 3d shap array to a matrix (1000 obs × 42 features)
+shap_matrix <- shap_values[,,1]  # Drop the singleton third dimension
+colnames(shap_matrix) <- paste0("V", 1:42)  # Match test_sample column names
+
+# Convert test_sample (NumPy array) to R matrix
+test_sample_r <- as.matrix(test_sample)
+colnames(test_sample_r) <- paste0("V", 1:42)  # Ensure feature names match
+
+
+feature_names <- dimnames(X_test_processed)[[2]]
+
+# Create a lookup table for V1, V2, ... to actual names
+feature_lookup <- setNames(feature_names, paste0("V", 1:length(feature_names)))
+
+shap_df <- data.frame(
+  obs_id = rep(1:1000, each = 42),  # 1000 observations, 42 features each
+  feature = rep(paste0("V", 1:42), times = 100),
+  shap_value = as.vector(t(shap_matrix)),
+  feature_value = as.vector(t(test_sample_r))
+)
+
+
+# Replace feature codes (V1, V2, ...) with actual names
+shap_df <- shap_df %>%
+  mutate(feature = recode(feature, !!!feature_lookup))
+
+
+# Too lazy to write a function for this 
+# Categorical  --- 
+shap_df %>%
+  filter(grepl("VehBrand",feature)) %>%
+  ggplot(aes(x = feature, y = shap_value)) +
+  geom_boxplot(fill = "steelblue") + 
+  geom_point(alpha = 0.5, color = "steelblue") +
+  geom_smooth(method = "loess", color = "red", se = FALSE) +
+  theme_minimal() + 
+  theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      plot.margin = margin(10, 10, 10, 35)) + 
+  labs(title = "SHAP Dependence Plot for VehBrand", x = "VehBrand", y = "SHAP Value") 
+
+# Area
+shap_df %>%
+  filter(grepl("Area",feature)) %>%
+  ggplot(aes(x = feature, y = shap_value)) +
+  geom_boxplot(fill = "steelblue") + 
+  geom_point(alpha = 0.5, color = "steelblue") +
+  geom_smooth(method = "loess", color = "red", se = FALSE) +
+  theme_minimal() + 
+  theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      plot.margin = margin(10, 10, 10, 35)) + 
+  labs(title = "SHAP Dependence Plot for Area", x = "Area", y = "SHAP Value") 
+
+# Region 
+shap_df %>%
+  filter(grepl("Region",feature)) %>%
+  ggplot(aes(x = feature, y = shap_value)) +
+  geom_boxplot(fill = "steelblue") + 
+  geom_point(alpha = 0.5, color = "steelblue") +
+  geom_smooth(method = "loess", color = "red", se = FALSE) +
+  theme_minimal() + 
+  theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      plot.margin = margin(10, 10, 10, 35)) + 
+  labs(title = "SHAP Dependence Plot for Region", x = "Region", y = "SHAP Value") 
+
+
+# Numeric ---
+
+
+shap_df %>%
+  filter(feature == "DrivAge") %>%
+  ggplot(aes(x = feature_value, y = shap_value)) +
+  geom_point(alpha = 0.5, color = "steelblue") +
+  geom_smooth(method = "loess", color = "red", se = FALSE) +
+  labs(title = "SHAP Dependence Plot for Driver Age", x = "Driver Age", y = "SHAP Value") +
+  theme_minimal()
+
+
+shap_df %>%
+  filter(feature == "VehPower") %>%
+  ggplot(aes(x = feature_value, y = shap_value)) +
+  geom_point(alpha = 0.5, color = "steelblue") +
+  geom_smooth(method = "loess", color = "red", se = FALSE) +
+  labs(title = "SHAP Dependence Plot for VehPower", x = "VehPower", y = "SHAP Value") +
+  theme_minimal()
+
+
+shap_df %>%
+  filter(feature == "VehAge") %>%
+  ggplot(aes(x = feature_value, y = shap_value)) +
+  geom_point(alpha = 0.5, color = "steelblue") +
+  geom_smooth(method = "loess", color = "red", se = FALSE) +
+  labs(title = "SHAP Dependence Plot for VehAge", x = "VehAge", y = "SHAP Value") +
+  theme_minimal()
+
+shap_df %>%
+  filter(feature == "BonusMalus") %>%
+  ggplot(aes(x = feature_value, y = shap_value)) +
+  geom_point(alpha = 0.5, color = "steelblue") +
+  geom_smooth(method = "loess", color = "red", se = FALSE) +
+  labs(title = "SHAP Dependence Plot for BonusMalus", x = "BonusMalus", y = "SHAP Value") +
+  theme_minimal()
+
+shap_df %>%
+  filter(feature == "Density") %>%
+  ggplot(aes(x = feature_value, y = shap_value)) +
+  geom_point(alpha = 0.5, color = "steelblue") +
+  geom_smooth(method = "loess", color = "red", se = FALSE) +
+  labs(title = "SHAP Dependence Plot for Density", x = "Density", y = "SHAP Value") +
+  theme_minimal()
+
+
+
+```
+
+## CatBoost Model {.scrollable}
+
+-   Going to 'cheat' because it takes ages to find optimal parameters
+
+```{r}
+#| label: Catboost
+#| warnings: false
+#| messages: false
+#| echo: true
+
+library(catboost)
+library(Metrics)
+
+
+# Define predictors and categorical features
+predictors <- c("VehPower","VehAge","DrivAge","BonusMalus","VehBrand","VehGas","Area","Density","Region")
+categorical_features <- c("VehBrand", "VehGas", "Area", "Region")
+
+# Prepare data pools
+train_pool <- catboost.load_pool(
+  data = df[df$Split == 1, .SD,.SDcols = predictors],
+  label = df$ClaimNb_W[df$Split == 1],
+  weight = df$Exposure[df$Split == 1],
+  cat_features = which(predictors %in% categorical_features) - 1  # 0-based indices
+)
+
+test_pool <- catboost.load_pool(
+  data = df[df$Split == 0, .SD,.SDcols = predictors],
+  label = df$ClaimNb_W[df$Split == 0],
+  weight = df$Exposure[df$Split == 0],
+  cat_features = which(predictors %in% categorical_features) - 1  # 0-based indices
+)
+
+
+
+
+full_pool <- catboost.load_pool(
+  data = df[, .SD,.SDcols = predictors],
+  weight = df$Exposure,
+  cat_features = which(predictors %in% categorical_features) - 1
+)
+
+# Set reasonable parameters
+params <- list(
+  iterations = 3000,
+  bagging_temperature = 0.8,
+  learning_rate = 0.025,
+  depth = 8,
+  l2_leaf_reg = 5,
+  border_count = 254,
+  grow_policy = 'Lossguide',
+  bootstrap_type = 'Bayesian',
+  min_data_in_leaf = 50, 
+  #subsample = 0.8,
+  loss_function = 'Poisson',
+  eval_metric = 'Poisson',
+  early_stopping_rounds = 50,
+  task_type = 'GPU',
+  max_ctr_complexity  = 3,
+  one_hot_max_size  = 15,
+  verbose = 100
+)
+
+# Train model with early stopping
+model <- catboost.train(
+  learn_pool = train_pool,
+  test_pool = test_pool,
+  params = params
+)
+
+# Make predictions and calculate deviance
+predicted_rates <- catboost.predict(model, full_pool)
+predicted_claims <- exp(predicted_rates) * df$Exposure
+df[,catboost_preds := predicted_claims]
+
+
+catboost_poisson_dev <- poisson_deviance(df$ClaimNb[df$Split==0], df$catboost_preds[df$Split==0])
+
+
+
+# Add to storage
+storage <-  tibble::add_row(storage,
+                            Model = "CatBoost",
+                            OutOfSampleDeviance = catboost_poisson_dev
+                            )
+
+# Show performance
+knitr::kable(storage %>% arrange(desc(OutOfSampleDeviance)))
+
+```
+
+## More Realistic GLMs
+
+### Non-Linearities
+
+-   Splines
+-   MARS
+-   GAMs
+-   Binning of numeric variables
+-   \[insert any reasonable technique\]
+
+#### SPLINES
+
+```{r}
+#| label: spline_glm
+#| warnings: false
+#| messages: false
+#| echo: true
+
+
+library(splines)
+
+splines_glm <- glm(ClaimNb ~ bs(VehPower,degree = 3) + bs(VehAge, degree=3) + bs(DrivAge, degree=3) + bs(BonusMalus, degree=3) + VehBrand + VehGas + Area + I(log(Density)+1) + Region + offset(log(Exposure)), 
+                   data = df[Split==1,], 
+                   family = poisson("log"))
+
+
+broom::tidy(splines_glm) |>
+  select(term, estimate, p.value) |>
+  mutate(p.value = scales::pvalue(p.value))
+
+
+# prediction
+df[, splines_glm_predictions := predict(splines_glm, df, type = "response")]
+
+# check out of sample deviance 
+spline_glm_dev <- poisson_deviance(df$ClaimNb[df$Split==0], df$splines_glm_predictions[df$Split==0]) # 49686.81
+
+# Add to storage
+storage <-  tibble::add_row(storage,
+                            Model = "GLM w/ Splines",
+                            OutOfSampleDeviance = spline_glm_dev
+                            )
+
+# Show performance
+knitr::kable(storage %>% arrange(desc(OutOfSampleDeviance)))
+```
+
+#### Fancier-Splines (ie GAMS)
+
+-   Feature shapes with automatic smoothing
+-   Excellent performance
+-   Very slow to run!
+
+```{r}
+#| label: gams
+#| warnings: false
+#| messages: false
+#| echo: true
+
+
+
+gam_model <- mgcv::bam(ClaimNb ~ s(VehPower, bs="cr") + s(VehAge,bs="cr") + s(DrivAge,bs="cr") + s(BonusMalus,bs="cr") + VehBrand + VehGas + Area + s(Density,bs="cr") + Region + offset(log(Exposure)), data = df[Split==1,], family = poisson("log"))
+
+
+
+# Plot all smooth terms (splines)
+plot(gam_model, pages = 1, residuals = TRUE)
+
+
+plot(gam_model, select = 1, 
+     shade = TRUE,          # Add confidence intervals
+     residuals = TRUE,      # Include partial residuals
+     main = "Effect of Vehicle Power",
+     xlab = "Vehicle Power",
+     ylab = "s(VehPower)")
+
+plot(gam_model, select = 2, 
+     shade = TRUE,          
+     residuals = TRUE,     
+     main = "Effect of Vehicle Age",
+     xlab = "Vehicle Age",
+     ylab = "s(VehAge)")
+
+plot(gam_model, select = 3,
+     shade = TRUE,          
+     residuals = TRUE,      
+     main = "Effect of Driver Age",
+     xlab = "Driver Age",
+     ylab = "s(DrivAge)")
+
+
+plot(gam_model, select = 4,
+     shade = TRUE,          
+     residuals = TRUE,      
+     main = "Effect of BonusMalus",
+     xlab = "BonusMalus",
+     ylab = "s(BonusMalus)")
+
+plot(gam_model, select = 8,
+     shade = TRUE,          
+     residuals = TRUE,      
+     main = "Effect of Density",
+     xlab = "Density",
+     ylab = "s(Density)")
+
+
+# predict on the full dataset
+df[, gam_predictions := predict(gam_model, df, type = "response")]
+
+# check the oos performance 
+gam_dev <- poisson_deviance(df$ClaimNb[df$Split==0], df$gam_predictions[df$Split==0]) # 49247.05
+
+# Add to storage
+storage <-  tibble::add_row(storage,
+                            Model = "GAM",
+                            OutOfSampleDeviance = gam_dev
+                            )
+
+# Show performance
+knitr::kable(storage %>% arrange(desc(OutOfSampleDeviance)))
+
+
+```
+
+## My favorite GLM trick {.scrollable}
+
+-   Inspired by ordinal coding
+-   Autoted feature shapes
+-   Automated feature selection (including dropping unneeded factor levels)
+
+### Inspired by Ordinal Coding
+
+-   Replace ordinal factor variables with an expanded matrix as below ...
+-   Fit GLM with L1/LASSO penalty
+
+```{r}
+#| warnings: false
+#| messages: false
+#| echo: true
+
+
+ordinal_encoding <- data.frame(OrdinalFactor = c("Good","Better","Best","GLM"))
+
+ordinal_encoding %>% 
+  mutate(
+    l1 = ifelse(OrdinalFactor %in% c("Good","Better","Best","GLM"),1,0),
+    l2 = ifelse(OrdinalFactor %in% c("Better","Best","GLM"),1,0),
+    l3 = ifelse(OrdinalFactor %in% c("Best","GLM"),1,0),
+    l4 = ifelse(OrdinalFactor %in% c("GLM"),1,0)
+         )
+
+```
+
+### Transform Numeric Columns
+
+1.  Select a numeric variable
+2.  Assign some breakpoints (eg bands of 1% - 5%. Smaller the better)
+3.  Replace numeric columns with abs(x - Some Level(i))
+4.  Fit LASSO GLM
+
+**Example transformation with DriverAge**
+
+```{r}
+#| warnings: false
+#| messages: false
+#| echo: true
+
+library(data.table)
+
+# Function 
+wdn_matrix_vec <- function(vec, brks) {
+  
+
+  # Compute mean of the vector, ignoring NAs
+  vec_mean <- mean(vec, na.rm = TRUE)
+  
+  # Create a data.table with transformed columns
+  dt <- data.table(vec)
+  
+  for (val in brks) {
+    new_col_name <- paste0("w_", val)
+    
+    # Compute the transformation
+    dt[, (new_col_name) := fifelse(
+      is.na(vec), 
+      fifelse(vec_mean < val, 1, 0), 
+      abs(vec - val)
+    )]
+  }
+  
+  return(dt)
+}
+
+# Exmaple with Driver Age
+DriverAge <- 17:80
+brks <- c(10,20,30,40,50,60,70)
+
+
+knitr::kable(wdn_matrix_vec(DriverAge, brks), caption = "Expansion of Driver Age Vector")
+
+```
+
+### Full Worked Example
+
+```{r}
+
+#| warnings: false
+#| messages: false
+#| echo: true
+
+
+library(h2o)
+library(dbplyr)
+library(DBI)
+
+h2o.init()
+
+
+
+rating_vars <- c("VehPower","VehAge","DrivAge","BonusMalus","VehBrand","VehGas","Area", "Density", "Region")
+
+
+
+
+
+# Function to find bins & lump rare levels 
+generate_blueprint <- function(dataframe, threshold = 0.001) {
+  blueprint <- list()
+  
+  for (column in names(dataframe)) {
+    tryCatch({
+      col_data <- dataframe[[column]]
+      
+      if (is.numeric(col_data)) {
+        # For numeric columns, calculate 5th percentile quantiles and get unique values
+        quantiles <- seq(0.05, 1.00, by = 0.01)
+        breaks <- quantile(col_data, probs = quantiles, na.rm = TRUE)
+        unique_breaks <- sort(unique(breaks)) # Get unique breaks and sort them
+        blueprint[[column]] <- unique_breaks
+      } else {
+        # For non-numeric columns, lump rare levels using lump_rare_levels function
+        lumped_levels <- lump_rare_levels(dataframe[[column]], threshold = threshold)
+        levels <- unique(lumped_levels)
+        levels <- levels[levels != "Other"] # Remove 'Other' level
+        blueprint[[column]] <- levels
+      }
+      
+    }, error = function(e) {
+      message(sprintf("Error processing column '%s': %s", column, e$message))
+      blueprint[[column]] <- sprintf("Error: Unable to process this column. Error message: %s", e$message)
+    })
+  }
+  
+  return(blueprint)
+}
+
+
+
+lump_rare_levels <- function(column_vector, total_count = NULL, threshold = 0.001, fill_value = "Unknown") {
+  # Convert to factor if not already
+  column_vector <- as.character(column_vector)
+  
+  # Replace NA values with the specified fill_value
+  column_vector[is.na(column_vector)] <- fill_value
+  
+  # Calculate total count if not provided
+  if (is.null(total_count)) {
+    total_count <- length(column_vector)
+  }
+  
+  # Calculate the frequency of each level
+  level_counts <- table(column_vector)
+  
+  # Identify levels that are below the threshold
+  rare_levels <- names(level_counts[level_counts / total_count < threshold])
+  
+  # Replace rare levels with 'Other'
+  column_vector[column_vector %in% rare_levels] <- "Other"
+  
+  return(factor(column_vector)) # Return as a factor
+}
+
+
+
+# Function to transform numeric columns into wide format. kills ram! 
+wdn_matrix <- function(col_name, brks) {
+  sapply(brks, function(val) {
+    sprintf('CAST(CASE WHEN "%s" IS NULL THEN CASE WHEN AVG("%s") OVER () < %s THEN 1 ELSE 0 END ELSE ABS(%s - %s) END AS FLOAT) AS "w_%s%s"',
+            col_name, col_name, val, col_name, val, col_name, val)
+  })
+}
+
+lump_fun <- function(col_name, levels) {
+  # Escape single quotes by replacing ' with '' damn you Provence-Alpes-Cotes-D'Azur!
+  levels_escaped <- gsub("'", "''", levels)
+  
+  # Construct the SQL IN clause
+  levels_str <- paste(sprintf("'%s'", levels_escaped), collapse = ", ")
+  
+  # Construct the final SQL expression
+  sprintf('CASE WHEN CAST("%s" AS VARCHAR) IN (%s) THEN "%s" ELSE \'Other\' END AS "%s_lumped"',
+          col_name, levels_str, col_name, col_name)
+}
+
+
+
+prep_dataframe <- function(variables, additional_columns = character(), formats_file, df = NULL, table_name = "dataset") {
+  # If a dataframe is provided, create a new in-memory DuckDB connection
+  if (!is.null(df)) {
+    con <- dbConnect(duckdb::duckdb(), ":memory:")
+    on.exit(dbDisconnect(con, shutdown = TRUE))
+    
+    # Write the dataframe to the in-memory database
+    dbWriteTable(con, table_name, df)
+  }
+  
+  # Check if the specified table exists
+  tables <- dbListTables(con)
+  if (!(table_name %in% tables)) {
+    stop(sprintf("The specified table '%s' does not exist in the database. Available tables are: %s",
+                 table_name, paste(tables, collapse = ", ")))
+  }
+  
+  expressions <- character()
+  
+  for (var in variables) {
+    if (!(var %in% dbListFields(con, table_name))) {
+      warning(sprintf("Column '%s' not found in the table. Skipping.", var))
+      next
+    }
+    
+    if (var %in% names(formats_file)) {
+      dict_values <- formats_file[[var]]
+      if (all(sapply(dict_values, is.numeric))) {
+        # Numeric variable: apply wdn_matrix
+        expressions <- c(expressions, wdn_matrix(var, dict_values))
+      } else {
+        # Categorical variable: apply lump_fun
+        expressions <- c(expressions, lump_fun(var, dict_values))
+      }
+    } else {
+      # Variable not in dictionary: keep as is
+      expressions <- c(expressions, sprintf('"%s"', var))
+    }
+  }
+  
+  # Add additional columns if they exist in the dataset
+  for (col in additional_columns) {
+    if (col %in% dbListFields(con, table_name)) {
+      expressions <- c(expressions, sprintf('"%s"', col))
+    } else {
+      warning(sprintf("Additional column '%s' not found in the table. Skipping.", col))
+    }
+  }
+  
+  # Combine all expressions into a single SQL query
+  query <- sprintf("SELECT %s FROM %s", paste(expressions, collapse = ", "), table_name)
+  
+  # Execute the query using DuckDB
+  result <- dbGetQuery(con, query)
+  
+  return(result)
+}
+
+
+# Generate a 'blueprint' for the dataset containing the relevant breaks 
+d <- generate_blueprint(df)
+
+# Prepare the dataset 
+df_prepped <- prep_dataframe(variables = rating_vars, formats_file = d,additional_columns = c("ClaimNb_W","Weight","Split"), df = df)
+
+# Convert strings to factors 
+df_prepped <- mutate(df_prepped,across(where(is.character), as.factor))
+
+# Inspect 
+df_prepped %>% glimpse()
+```
+
+### Fit Model with H2o
+
+```{r}
+#| warnings: false
+#| messages: false
+#| echo: true
+
+
+# Upload 
+df_h <- as.h2o(df_prepped, destination_frame = "main")
+
+# split train/test set
+h_train <- h2o.assign(df_h[df_h$Split == 1,],key = "train")
+h_test <- h2o.assign(df_h[df_h$Split == 0,], key = "test")
+
+
+# define the variables
+target <- "ClaimNb_W"
+weight <- "Weight"
+ignore <- "Split"
+
+# Define predictors
+predictors <- setdiff(colnames(df_h),c(target,weight,ignore))
+
+# Build model 
+glm_shaped <- h2o.glm(
+  x = predictors,
+  y = target,
+  weights_column = weight,
+  training_frame = h_train,
+  nfolds = 10,
+  alpha = 1,
+  lambda_search = TRUE,
+  family = "poisson",
+  standardize = TRUE
+  
+)
+
+
+# Make predictions 
+glm_shaped_predictions <- as.vector(unlist(h2o.predict(glm_shaped, df_h)))
+df[,shaped_glm_predictions := glm_shaped_predictions*Exposure]
+
+
+
+shaped_glm_deviance <- poisson_deviance(df$ClaimNb[df$Split==0], df$shaped_glm_predictions[df$Split==0])
+
+# Add to storage
+storage <-  tibble::add_row(storage,
+                            Model = "Auto GLM",
+                            OutOfSampleDeviance = shaped_glm_deviance
+                            )
+
+# Show performance
+knitr::kable(storage %>% arrange(desc(OutOfSampleDeviance)))
+
+
+
+```
+
+### Visualise & Extract Shapes
+
+```{r}
+#| warnings: false
+#| messages: false
+#| echo: true
+
+
+
+
+# Take the first line of data as the baseline variable 
+df_for_scoring <- df[1,]
+
+# Create generic function for building the scoring frame 
+build_df <- function(data) {
+  prep_dataframe(
+    variables = rating_vars, 
+    formats_file = d,
+    additional_columns = c("ClaimNb_W","Weight","Split"), 
+    df = data)
+}
+
+
+MakeTable <- function(var_name, unique_items, dataframe, prep_func, model) {
+
+      
+  # Length of unique_items
+  n <- length(unique_items)
+
+  # Duplicate the row n times
+  new_df <- as.data.frame(dataframe[rep(seq_len(nrow(dataframe[1, ])), n), ])
+
+  # Replace the column of interest with the unique_items
+  new_df[[var_name]] <- unique_items
+
+  # Prepare the new dataframe with the prep function
+  prepped <- prep_func(new_df)
+
+  # Migrate into h2o 
+  prepped_h <- h2o::as.h2o(prepped, destination_frame = "p")
+
+  # Make predictions with the model
+  predictions <- h2o::h2o.predict(model, newdata = prepped_h)
+
+  # Process predictions
+  preds <- unlist(as.vector(predictions))
+  preds <- preds / mean(preds)
+
+  # Return predictions as a data frame
+  df <- data.frame(
+    "variable" = var_name,
+    "level" = unique_items,
+    "Prediction" = base::round(preds, digits = 2)
+  )
+
+  # Return final dataframe
+  return(df)
+}
+
+
+
+
+# Loop through each dataframe in the list
+lapply(rating_vars, function(x) {
+  tryCatch({
+    MakeTable(
+      var_name = x,
+      unique_items = d[[x]],
+      prep_func = build_df,
+      dataframe = df_for_scoring,
+      model = glm_shaped
+    ) %>% 
+      ggplot()+
+      geom_line(aes(x=level,y=Prediction,group=1))+
+      theme_minimal() + 
+      theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      plot.margin = margin(10, 10, 10, 35)) +
+      ggtitle(paste0("Relativity for:",x))
+    
+  }, error = function(e) {
+    warning(paste("Error in processing variable:", x, "\nError message:", e$message))
+    return(NULL)
+  })
+})
+
+```
+
+## Add Interactions {.scrollable}
+
+### Neural Network Interactions
+
+```{r}
+#| warnings: false
+#| messages: false
+#| echo: true
+
+### NN Interactions 
+
+
+np <- import("numpy")
+
+predict_function <- function(data) {
+  data_r <- py_to_r(data)
+  predictions <- predict(best_nn, as.matrix(data_r)) %>% as.vector()
+  np$array(matrix(predictions, ncol = 1))  # Ensure it's a 2D array
+}
+
+
+# 2. Convert to Python callable
+predict_function_py <- py_func(predict_function)
+
+# 3. Prepare data (ensure 2D arrays)
+background_data <- np$array(X_train_processed[sample(nrow(X_train_processed), 1000), , drop = FALSE])
+test_sample <- np$array(X_test_processed[1:1000, , drop = FALSE])
+
+# Initialize SHAP DeepExplainer (works for neural networks)
+explainer <- shap$DeepExplainer(best_nn, background_data)
+
+# Compute SHAP values (includes interaction effects)
+shap_values <- explainer$shap_values(test_sample)
+
+
+
+
+# Convert SHAP values into a long format (preserving feature names)
+shap_df <- as.data.frame(shap_values[,,1])  # Extract first output column
+colnames(shap_df) <- colnames(X_test_processed)
+shap_df$sample_id <- 1:nrow(shap_df)  # Add row index
+
+shap_long <- tidyr::pivot_longer(shap_df, cols = -sample_id, names_to = "feature", values_to = "shap_value")
+
+
+X_test_sample <- as.data.frame(X_test_processed[1:1000, ])
+X_test_sample$sample_id <- 1:nrow(X_test_sample)  # Add row index
+
+# Reshape X_test_sample to match shap_long format
+X_test_long <- tidyr::pivot_longer(X_test_sample, cols = -sample_id, names_to = "feature", values_to = "feature_value")
+
+# Join feature values with shap values
+shap_long <- dplyr::left_join(shap_long, X_test_long, by = c("sample_id", "feature"))
+
+# Check dimensions
+# dim(shap_long)  
+
+
+# shap_long %>%
+#   filter(grepl("Area",feature)) %>%
+#   left_join(shap_long %>% filter( grepl("Density",feature)) %>%
+#               select(sample_id, feature_value) %>%
+#               rename(interaction_value = feature_value),
+#             by = "sample_id")
+
+# Define the primary feature (X-axis) and the interaction feature (color)
+
+
+plt_interaction <- function(primary_feature,interaction_feature){
+  
+# Filter for the primary feature
+shap_plot_data <- shap_long %>%
+  filter(grepl(primary_feature,feature)) %>%
+  left_join(shap_long %>% filter( grepl(interaction_feature,feature)) %>%
+              select(sample_id, feature_value) %>%
+              rename(interaction_value = feature_value),
+            by = "sample_id") %>% 
+  group_by(feature) %>% 
+  arrange(feature_value) %>% 
+  mutate(x_axis = paste0(feature,"_",feature_value)) %>% 
+  ungroup() %>% 
+  mutate(x_axis = forcats::fct_inorder(x_axis)) %>% 
+  ggplot(aes(x = x_axis, y = shap_value, color = interaction_value,group=1)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "loess", se = FALSE) +
+  scale_color_gradient(low = "blue", high = "red") +
+  labs(title = paste0("SHAP Dependence Plot: ", primary_feature, " vs ", interaction_feature),
+       x = primary_feature, 
+       y = "SHAP Value",
+       color = interaction_feature) +
+  theme_minimal()+
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+  # ggplot(aes(x = feature_value, y = shap_value, color = interaction_value)) +
+  # geom_point(alpha = 0.5) +
+  # geom_smooth(method = "loess", se = FALSE) +
+  # scale_color_gradient(low = "blue", high = "red") +
+  # labs(title = paste0("SHAP Dependence Plot: ", primary_feature, " vs ", interaction_feature),
+  #      x = primary_feature, 
+  #      y = "SHAP Value",
+  #      color = interaction_feature) +
+  # theme_minimal()
+}
+
+features <- c("VehPower", "VehAge", "DrivAge", "BonusMalus", "Density","VehBrand","VehGas","Area")
+combinations <- combn(features, 2)
+pairs <- data.frame(t(combinations))
+colnames(pairs) <- c("primary_feature", "interaction_feature")
+
+# works if not 
+purrr::map2(pairs$primary_feature, pairs$interaction_feature,  ~plt_interaction(primary_feature = .x, interaction_feature = .y))
+
+
+
+# Area x Density
+shap_long %>%
+  filter(grepl("Area",feature)) %>%
+  left_join(shap_long %>% filter( grepl("Density",feature)) %>%
+              select(sample_id, feature_value) %>%
+              rename(interaction_value = feature_value),
+            by = "sample_id") %>%
+  group_by(feature) %>% 
+  arrange(feature_value) %>% 
+  mutate(x_axis = paste0(feature,"_",feature_value)) %>% 
+  ungroup() %>% 
+  mutate(x_axis = forcats::fct_inorder(x_axis)) %>% 
+  ggplot(aes(x = x_axis, y = shap_value, color = interaction_value,group=1)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "loess", se = FALSE) +
+  scale_color_gradient(low = "blue", high = "red") +
+  labs(title = paste0("SHAP Dependence Plot: ", "VehPower", " vs ", "Density"),
+       x = "VehPower", 
+       y = "SHAP Value") +
+  theme_minimal()+
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+
+
+```
+
+### CatBoost interactions
+
+```{r}
+#| label: catboost-interactions
+#| warnings: false
+#| messages: false
+#| echo: true
+
+library(catboost)
+library(shapviz)
+library(data.table)
+
+# 1. Prepare data
+set.seed(22)
+predictors <- c("VehPower","VehAge","DrivAge","BonusMalus","VehBrand","VehGas","Area","Density","Region")
+X_explain <- df[sample(nrow(df), 1000), .SD, .SDcols = predictors]
+
+# 2. Convert to catboost.Pool (include categorical features if needed)
+pool_explain <- catboost.load_pool(
+  data = X_explain,
+  cat_features = which(sapply(X_explain, is.factor)) - 1  # 0-based indices
+)
+
+# 3. Compute SHAP matrix
+shap_matrix <- catboost.get_feature_importance(
+  model, 
+  pool_explain, 
+  type = "ShapValues"
+)
+
+# 4. Clean SHAP values
+shap_values <- shap_matrix[, -ncol(shap_matrix)]  # Exclude baseline column
+colnames(shap_values) <- colnames(X_explain)  # <<< CRITICAL FIX >>>
+baseline <- shap_matrix[1, ncol(shap_matrix)]  # Baseline value
+
+# 5. Create shapviz object
+shap_values_cb <- shapviz(
+  object = shap_values, 
+  X = X_explain, 
+  baseline = baseline
+)
+
+# 6. Plot results
+sv_importance(shap_values_cb)
+
+
+for (x in predictors) {
+  plt <- sv_dependence(shap_values_cb, v = x) + 
+    theme_minimal() + 
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),  # Rotate labels 45°
+      plot.margin = margin(10, 10, 10, 35)  # Adjust margins if labels are clipped
+    )
+  print(plt)
+}
+
+
+```
+
+### Add Interactions into GLM
+
+-   Centre Region \* BonusMalus
+-   BonusMalus \* VehBrand
+-   BonusMalus \* Density
+-   BonusMalus \* DrivAge
+-   BonusMalus \* VehAge
+
+```{r}
+#| warnings: false
+#| messages: false
+#| echo: true
+
+df[,shaped_glm_predictions := glm_shaped_predictions*Exposure]
+df[,Interaction_Target := ClaimNb/shaped_glm_predictions]
+
+library(mgcv)
+
+
+offset_gam <- bam(ClaimNb ~ 
+                    I(ifelse(Region == "Centre",1,0) * BonusMalus) +
+                    # I(ifelse(VehBrand == "B12",1,0) * BonusMalus) + 
+                    s(BonusMalus, bs = "cr", by = VehBrand) + 
+                    te(BonusMalus, Density, bs = "cr") + 
+                    te(BonusMalus, DrivAge, bs = "cr") + 
+                    te(BonusMalus, VehAge, bs = "cr") + 
+                    offset(log(shaped_glm_predictions)),
+                  data = df[Split == 1, ],
+                  family = poisson("log"))
+
+
+broom::tidy(offset_gam)
+
+# Predict on full dataset 
+
+df[,interaction_glm_predictions := predict(offset_gam, newdata = df, type = "response")]
+
+interaction_glm_deviance <- poisson_deviance(df$ClaimNb[df$Split==0], df$interaction_glm_predictions[df$Split==0])
+
+# Add to storage
+storage <-  tibble::add_row(storage,
+                            Model = "Auto GLM + Interactions",
+                            OutOfSampleDeviance = interaction_glm_deviance
+                            )
+
+# Show performance
+knitr::kable(storage %>% arrange(desc(OutOfSampleDeviance)))
+
+```

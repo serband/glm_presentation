@@ -1,0 +1,10 @@
+project:
+  type: website
+  title: "GLMsAreGood"
+
+format:
+  revealjs:
+    transition: slide
+    theme: default
+    footer: "GLMsAreGood Presentation"
+    editor: visual
